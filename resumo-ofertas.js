@@ -67,6 +67,15 @@ function resumoSemIA(mensagens) {
   return pontuadas.slice(0, 15).map(x => x.m).join("\n\n");
 }
 
+function verificarLinks(resposta, original) {
+  // Se a IA mudou ou inventou um link, marca-o para não clicares às cegas
+  const conhecidos = new Set((original.match(/https?:\/\/[^\s)\]>"']+/g) || []).map(u => u.replace(/[.,;:!?]+$/, "")));
+  return resposta.replace(/https?:\/\/[^\s)\]>"']+/g, u => {
+    const limpo = u.replace(/[.,;:!?]+$/, "");
+    return conhecidos.has(limpo) ? u : `${u} (ATENÇÃO: link não confirmado, procura o produto no canal)`;
+  });
+}
+
 async function resumir(mensagens) {
   if (!GEMINI_KEY) return resumoSemIA(mensagens);
 
@@ -75,6 +84,7 @@ async function resumir(mensagens) {
     "Estas são mensagens de canais portugueses de ofertas, leilões e cupões. " +
     "Escolhe só as 10 melhores (preço muito baixo, desconto grande ou cupão que compensa de verdade). " +
     "Para cada uma: nome do produto, preço antes e agora, desconto, e o link. " +
+    "Copia os links EXATAMENTE como aparecem nas mensagens, sem mudar nenhum carácter e sem inventar links. " +
     "Português de Portugal, curto, sem enfeites, texto simples sem markdown. Ignora spam e repetições.\n\n" + texto;
 
   try {
@@ -89,7 +99,7 @@ async function resumir(mensagens) {
     const json = await res.json();
     const out = json.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("\n");
     if (!out) throw new Error(JSON.stringify(json).slice(0, 300));
-    return out;
+    return verificarLinks(out, texto);
   } catch (e) {
     // Se a IA falhar (quota, modelo mudou, etc.), usa o resumo simples
     return "(A IA falhou, aqui vai o resumo simples: " + e.message + ")\n\n" + resumoSemIA(mensagens);
