@@ -11,6 +11,7 @@ const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID;
 const GEMINI_KEY = process.env.GEMINI_API_KEY; // opcional (chave gratuita do Google AI Studio)
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
+const GEMINI_MODEL_RESERVA = process.env.GEMINI_MODEL_RESERVA || "gemini-flash-lite-latest";
 const HORAS = 24;
 const MAX_PAGINAS = 15; // cada página tem cerca de 20 mensagens
 const MAX_OFERTAS = 10;
@@ -19,7 +20,7 @@ const INTERESSES = (process.env.INTERESSES || "").split(",").map(s => s.trim()).
 
 // Domínios que reconheces. Links de outros domínios aparecem com um aviso.
 const DOMINIOS_OK = (process.env.DOMINIOS_OK ||
-  "descontosainanas.com,amzn.to,amzn.eu,amazon.es,amazon.com,amazon.pt,chollometro.com,pcdiga.com,worten.pt,fnac.pt,aliexpress.com,zalando.pt,kuantokusta.pt,radiopopular.pt,pccomponentes.pt,mediamarkt.pt,primor.eu,notino.pt,decathlon.pt,prozis.com"
+  "descontosainanas.com,amzn.to,amzn.eu,amazon.es,amazon.com,amazon.pt,chollometro.com,pcdiga.com,worten.pt,fnac.pt,aliexpress.com,zalando.pt,kuantokusta.pt,radiopopular.pt,pccomponentes.pt,mediamarkt.pt,primor.eu,notino.pt,decathlon.pt,prozis.com,cupoestafixe.com,chollo.to"
 ).split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
 // ---------- Leitura dos canais ----------
@@ -29,8 +30,10 @@ function limpar(html) {
     .replace(/<a [^>]*href="([^"]+)"[^>]*>[\s\S]*?<\/a>/g, " $1 ")
     .replace(/<br\s*\/?>/g, "\n")
     .replace(/<[^>]+>/g, "")
-    .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
     .trim();
 }
 
@@ -82,7 +85,9 @@ async function lerCanal(canal) {
 
 function melhorLink(m) {
   // Primeiro link da mensagem original que não seja do próprio Telegram
-  const links = extrairLinks(m.texto).filter(u => !/^https?:\/\/(t\.me|telegram\.me)\//i.test(u));
+  const links = extrairLinks(m.texto)
+    .filter(u => !/^https?:\/\/(t\.me|telegram\.me)\//i.test(u))
+    .filter(u => !/\.(png|jpe?g|gif|webp)(\?|$)/i.test(u));
   return links[0] || m.postUrl || "(sem link)";
 }
 
@@ -98,9 +103,22 @@ function avisoDominio(link) {
 
 // ---------- Resumo ----------
 
+function prepararMensagens(msgs) {
+  // Só mensagens com preço, percentagem ou cupão; sem esgotadas; sem repetidas entre canais
+  const vistos = new Set();
+  return msgs.filter(m => {
+    if (!/[€%]|cup[aã]o|c[oó]digo/i.test(m.texto)) return false;
+    if (/agotado|esgot(ou|ad[oa])|sold out/i.test(m.texto)) return false;
+    const chave = m.texto.toLowerCase().replace(/[^a-z0-9à-ú]+/g, " ").trim().slice(0, 80);
+    if (vistos.has(chave)) return false;
+    vistos.add(chave);
+    return true;
+  });
+}
+
 function resumoSemIA(msgs) {
   // Sem IA: ordena pelas percentagens de desconto mais altas
-  const pontuadas = msgs.map(m => {
+  const pontuadas = prepararMensagens(msgs).map(m => {
     const pct = m.texto.match(/(\d{2,3})\s?%/);
     return { m, pct: pct ? Number(pct[1]) : 0, cupao: /cup[aã]o|c[oó]digo/i.test(m.texto) };
   }).filter(x => x.pct >= 40 || x.cupao);
@@ -157,23 +175,35 @@ function lerJSON(texto) {
 }
 
 async function resumirComIA(msgs) {
-  const corpo = msgs
-    .map((m, i) => `[${i}] (${m.canal}) ${m.texto.slice(0, 600)}`)
+  const lista = prepararMensagens(msgs);
+  if (!lista.length) throw new Error("Nenhuma mensagem com preço ou cupão");
+  const corpo = lista
+    .map((m, i) => `[${i}] (${m.canal}) ${m.texto.slice(0, 450)}`)
     .join("\n---\n")
-    .slice(0, 400000);
+    .slice(0, 250000);
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_KEY },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: INSTRUCOES }] },
-        contents: [{ parts: [{ text: "Mensagens:\n\n" + corpo }] }],
-        generationConfig: { responseMimeType: "application/json", responseSchema: ESQUEMA },
-      }),
+  const pedido = {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_KEY },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: INSTRUCOES }] },
+      contents: [{ parts: [{ text: "Mensagens:\n\n" + corpo }] }],
+      generationConfig: { responseMimeType: "application/json", responseSchema: ESQUEMA },
+    }),
+  };
+  // Tenta o modelo principal e, se estiver sobrecarregado, um modelo de reserva
+  const modelos = [...new Set([GEMINI_MODEL, GEMINI_MODEL_RESERVA])];
+  const espera = Number(process.env.ESPERA_MS || 30000);
+  let res;
+  tudo: for (const modelo of modelos) {
+    const urlGemini = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`;
+    for (let tentativa = 1; tentativa <= 3; tentativa++) {
+      res = await fetch(urlGemini, pedido);
+      if (res.ok) break tudo;
+      if (![429, 500, 503].includes(res.status)) break; // erro que repetir não resolve: passa ao modelo seguinte
+      if (tentativa < 3) await new Promise(r => setTimeout(r, espera * tentativa)); // espera 30s, 60s
     }
-  );
+  }
   const json = await res.json();
   const bruto = json.candidates?.[0]?.content?.parts?.filter(p => !p.thought)?.map(p => p.text || "").join("");
   if (!bruto) throw new Error(JSON.stringify(json).slice(0, 300));
@@ -182,7 +212,7 @@ async function resumirComIA(msgs) {
   const vistos = new Set();
   const linhas = [];
   for (const it of itens) {
-    const m = msgs[it.id];
+    const m = lista[it.id];
     if (!m || vistos.has(it.id)) continue; // ignora números inventados ou repetidos
     vistos.add(it.id);
     const link = melhorLink(m);
