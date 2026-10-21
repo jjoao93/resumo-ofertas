@@ -1,6 +1,10 @@
 // Lê canais públicos do Telegram (t.me/s/canal), apanha as mensagens das
 // últimas 24h e manda-te um resumo das melhores ofertas no Telegram.
 // Precisa de Node 18 ou superior.
+//
+// Como funciona a IA: o Gemini só ESCOLHE as melhores mensagens (devolve os
+// números delas e os dados do produto). Os links vêm sempre das mensagens
+// originais, copiados pelo script, por isso a IA nunca consegue estragá-los.
 
 const CANAIS = (process.env.CANAIS || "").split(",").map(s => s.trim()).filter(Boolean);
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -9,6 +13,16 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY; // opcional (chave gratuita do Go
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 const HORAS = 24;
 const MAX_PAGINAS = 15; // cada página tem cerca de 20 mensagens
+const MAX_OFERTAS = 10;
+// Lista opcional do que te interessa, separada por vírgulas (segredo INTERESSES no GitHub).
+const INTERESSES = (process.env.INTERESSES || "").split(",").map(s => s.trim()).filter(Boolean);
+
+// Domínios que reconheces. Links de outros domínios aparecem com um aviso.
+const DOMINIOS_OK = (process.env.DOMINIOS_OK ||
+  "descontosainanas.com,amzn.to,amzn.eu,amazon.es,amazon.com,amazon.pt,chollometro.com,pcdiga.com,worten.pt,fnac.pt,aliexpress.com,zalando.pt,kuantokusta.pt,radiopopular.pt,pccomponentes.pt,mediamarkt.pt,primor.eu,notino.pt,decathlon.pt,prozis.com"
+).split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
+// ---------- Leitura dos canais ----------
 
 function limpar(html) {
   return html
@@ -18,6 +32,10 @@ function limpar(html) {
     .replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
     .trim();
+}
+
+function extrairLinks(texto) {
+  return (texto.match(/https?:\/\/[^\s)\]>"']+/g) || []).map(u => u.replace(/[.,;:!?]+$/, ""));
 }
 
 async function lerCanal(canal) {
@@ -47,64 +65,157 @@ async function lerCanal(canal) {
       maisAntigo = Math.min(maisAntigo, t);
       const texto = b.match(/tgme_widget_message_text[^>]*>([\s\S]*?)<\/div>/);
       if (!texto || t < limite) continue;
-      msgs.push(`[${canal}] ${limpar(texto[1])}${post ? `\nhttps://t.me/${post[1]}/${post[2]}` : ""}`);
+      msgs.push({
+        canal,
+        texto: limpar(texto[1]),
+        postUrl: post ? `https://t.me/${post[1]}/${post[2]}` : null,
+      });
     }
 
-    // Se já chegámos a mensagens com mais de 24h, paramos
     if (maisAntigo < limite || !isFinite(menorId)) break;
     before = menorId;
   }
   return msgs;
 }
 
-function resumoSemIA(mensagens) {
-  // Sem IA: ordena pelas percentagens de desconto mais altas
-  const pontuadas = mensagens.map(m => {
-    const pct = m.match(/(\d{2,3})\s?%/);
-    return { m, pct: pct ? Number(pct[1]) : 0, cupao: /cup[aã]o|c[oó]digo/i.test(m) };
-  }).filter(x => x.pct >= 40 || x.cupao);
-  pontuadas.sort((a, b) => b.pct - a.pct);
-  return pontuadas.slice(0, 15).map(x => x.m).join("\n\n");
+// ---------- Links ----------
+
+function melhorLink(m) {
+  // Primeiro link da mensagem original que não seja do próprio Telegram
+  const links = extrairLinks(m.texto).filter(u => !/^https?:\/\/(t\.me|telegram\.me)\//i.test(u));
+  return links[0] || m.postUrl || "(sem link)";
 }
 
-function verificarLinks(resposta, original) {
-  // Se a IA mudou ou inventou um link, marca-o para não clicares às cegas
-  const conhecidos = new Set((original.match(/https?:\/\/[^\s)\]>"']+/g) || []).map(u => u.replace(/[.,;:!?]+$/, "")));
-  return resposta.replace(/https?:\/\/[^\s)\]>"']+/g, u => {
-    const limpo = u.replace(/[.,;:!?]+$/, "");
-    return conhecidos.has(limpo) ? u : `${u} (ATENÇÃO: link não confirmado, procura o produto no canal)`;
-  });
-}
-
-async function resumir(mensagens) {
-  if (!GEMINI_KEY) return resumoSemIA(mensagens);
-
-  const texto = mensagens.join("\n---\n").slice(0, 150000);
-  const prompt =
-    "Estas são mensagens de canais portugueses de ofertas, leilões e cupões. " +
-    "Escolhe só as 10 melhores (preço muito baixo, desconto grande ou cupão que compensa de verdade). " +
-    "Para cada uma: nome do produto, preço antes e agora, desconto, e o link. " +
-    "Copia os links EXATAMENTE como aparecem nas mensagens, sem mudar nenhum carácter e sem inventar links. " +
-    "Português de Portugal, curto, sem enfeites, texto simples sem markdown. Ignora spam e repetições.\n\n" + texto;
-
+function avisoDominio(link) {
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_KEY },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-      }
-    );
-    const json = await res.json();
-    const out = json.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("\n");
-    if (!out) throw new Error(JSON.stringify(json).slice(0, 300));
-    return verificarLinks(out, texto);
-  } catch (e) {
-    // Se a IA falhar (quota, modelo mudou, etc.), usa o resumo simples
-    return "(A IA falhou, aqui vai o resumo simples: " + e.message + ")\n\n" + resumoSemIA(mensagens);
+    const host = new URL(link).hostname.replace(/^www\./, "").toLowerCase();
+    const ok = DOMINIOS_OK.some(d => host === d || host.endsWith("." + d));
+    return ok ? "" : ` ⚠ domínio desconhecido (${host}), confirma antes de clicar`;
+  } catch {
+    return "";
   }
 }
+
+// ---------- Resumo ----------
+
+function resumoSemIA(msgs) {
+  // Sem IA: ordena pelas percentagens de desconto mais altas
+  const pontuadas = msgs.map(m => {
+    const pct = m.texto.match(/(\d{2,3})\s?%/);
+    return { m, pct: pct ? Number(pct[1]) : 0, cupao: /cup[aã]o|c[oó]digo/i.test(m.texto) };
+  }).filter(x => x.pct >= 40 || x.cupao);
+  pontuadas.sort((a, b) => b.pct - a.pct);
+  return pontuadas.slice(0, 15).map(({ m }) => {
+    const l = melhorLink(m);
+    return `[${m.canal}] ${m.texto.slice(0, 300)}\n${l}${avisoDominio(l)}`;
+  }).join("\n\n");
+}
+
+const BLOCO_INTERESSES = INTERESSES.length
+  ? "PRIORIDADE MÁXIMA: se aparecer alguma oferta destes produtos ou categorias a bom preço, inclui-a e põe-na no topo, mesmo com desconto percentual menor: " +
+    INTERESSES.join("; ") + ".\n\n"
+  : "";
+
+const INSTRUCOES =
+  "És um assistente que filtra ofertas para um consumidor português. " +
+  "Recebes mensagens de canais de ofertas, leilões e cupões, cada uma com um número entre parênteses retos, por exemplo [12]. " +
+  `Escolhe no máximo ${MAX_OFERTAS} mensagens que compensam mesmo, da melhor para a pior.\n\n` +
+  BLOCO_INTERESSES +
+  "O que conta como oferta que compensa:\n" +
+  "- desconto real grande (a partir de uns 40%) OU poupança grande em euros num produto que as pessoas querem;\n" +
+  "- preço final muito baixo para o que é;\n" +
+  "- cupões ou códigos que baixam mesmo o preço (indica o código no campo cupao);\n" +
+  "- produtos úteis ou de marca conhecida valem mais do que artigos obscuros com a mesma percentagem.\n\n" +
+  "Regras:\n" +
+  "- Usa só informação que está na mensagem. Nunca inventes preços, descontos, códigos ou nomes. Se não vier, deixa vazio.\n" +
+  "- Se o mesmo produto aparecer em várias mensagens ou canais, escolhe só a mais barata.\n" +
+  "- Ignora anúncios, publicidade, sorteios, conversa e mensagens sem preço claro.\n" +
+  "- Não devolvas links. O programa junta os links originais a partir do número da mensagem.\n" +
+  "- Escreve em português de Portugal. Preços no formato 13,51€.\n" +
+  "- No campo motivo, uma frase curta e factual (máximo 12 palavras) sobre porque compensa.";
+
+const ESQUEMA = {
+  type: "ARRAY",
+  items: {
+    type: "OBJECT",
+    properties: {
+      id: { type: "INTEGER", description: "Número da mensagem original" },
+      produto: { type: "STRING" },
+      preco_antes: { type: "STRING", nullable: true },
+      preco_agora: { type: "STRING", nullable: true },
+      desconto_percent: { type: "INTEGER", nullable: true },
+      cupao: { type: "STRING", nullable: true },
+      motivo: { type: "STRING" },
+    },
+    required: ["id", "produto", "motivo"],
+  },
+};
+
+function lerJSON(texto) {
+  const limpo = texto.replace(/```json|```/g, "").trim();
+  return JSON.parse(limpo);
+}
+
+async function resumirComIA(msgs) {
+  const corpo = msgs
+    .map((m, i) => `[${i}] (${m.canal}) ${m.texto.slice(0, 600)}`)
+    .join("\n---\n")
+    .slice(0, 400000);
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_KEY },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: INSTRUCOES }] },
+        contents: [{ parts: [{ text: "Mensagens:\n\n" + corpo }] }],
+        generationConfig: { responseMimeType: "application/json", responseSchema: ESQUEMA },
+      }),
+    }
+  );
+  const json = await res.json();
+  const bruto = json.candidates?.[0]?.content?.parts?.filter(p => !p.thought)?.map(p => p.text || "").join("");
+  if (!bruto) throw new Error(JSON.stringify(json).slice(0, 300));
+  const itens = lerJSON(bruto);
+
+  const vistos = new Set();
+  const linhas = [];
+  for (const it of itens) {
+    const m = msgs[it.id];
+    if (!m || vistos.has(it.id)) continue; // ignora números inventados ou repetidos
+    vistos.add(it.id);
+    const link = melhorLink(m);
+    const partes = [];
+    if (it.preco_antes || it.preco_agora) {
+      partes.push(`${it.preco_antes ? "Antes: " + it.preco_antes : ""}${it.preco_antes && it.preco_agora ? " | " : ""}${it.preco_agora ? "Agora: " + it.preco_agora : ""}`);
+    }
+    if (it.desconto_percent) partes.push(`Desconto: ${it.desconto_percent}%`);
+    if (it.cupao) partes.push(`Cupão: ${it.cupao}`);
+    linhas.push(
+      `${linhas.length + 1}. ${it.produto}\n` +
+      (partes.length ? partes.join(" | ") + "\n" : "") +
+      `${it.motivo}\n` +
+      `Canal: ${m.canal}\n` +
+      `${link}${avisoDominio(link)}`
+    );
+    if (linhas.length >= MAX_OFERTAS) break;
+  }
+  if (!linhas.length) throw new Error("A IA não devolveu ofertas válidas");
+  return linhas.join("\n\n");
+}
+
+async function resumir(msgs) {
+  if (!GEMINI_KEY) return resumoSemIA(msgs);
+  try {
+    return await resumirComIA(msgs);
+  } catch (e) {
+    // Se a IA falhar (quota, modelo mudou, etc.), usa o resumo simples
+    return `(A IA falhou, aqui vai o resumo simples: ${e.message})\n\n` + resumoSemIA(msgs);
+  }
+}
+
+// ---------- Envio ----------
 
 async function enviar(texto) {
   const partes = texto.match(/[\s\S]{1,3900}/g) || ["Sem ofertas hoje."];
