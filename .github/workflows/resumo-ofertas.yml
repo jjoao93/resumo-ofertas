@@ -1,0 +1,22 @@
+name: Resumo de ofertas
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # todos os dias às 8h UTC
+  workflow_dispatch:       # permite correr à mão
+
+jobs:
+  resumo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node resumo-ofertas.js
+        env:
+          CANAIS: ${{ secrets.CANAIS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
